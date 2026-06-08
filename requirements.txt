@@ -1,0 +1,11 @@
+# Core
+torch>=2.2
+transformers>=4.40
+numpy>=1.24
+scikit-learn>=1.3
+tqdm>=4.66
+
+# Content embeddings (Sentence-T5). Needed to reproduce the paper's Semantic IDs.
+# Pulls in the HuggingFace model on first use, so internet access is required for
+# the real experiments. The smoke test / --emb-backend random path does NOT need it.
+sentence-transformers>=2.7

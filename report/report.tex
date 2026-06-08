@@ -1,0 +1,251 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=0.75in]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{nosep,leftmargin=1.2em}
+\titlespacing*{\section}{0pt}{6pt}{2pt}
+\titlespacing*{\subsection}{0pt}{4pt}{1pt}
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection}{0.5em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+
+% Placeholder for numbers the team fills in after the GPU runs.
+\newcommand{\fic}{\textcolor{gray}{$\cdot$}} % fill-in cell
+
+\title{\vspace{-2.5em}\textbf{Generative Retrieval for Recommendation:\\
+a Reproduction and Controlled Study of TIGER}}
+\author{Anna Kiseleva \quad Maya Lager \quad Kseniia Tsypliakova\\
+\normalsize HSE University --- DeepRecSys final project}
+\date{\vspace{-1em}}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+\begin{abstract}
+\noindent
+TIGER (Rajput et al., NeurIPS 2023) reframes sequential recommendation as
+\emph{generative retrieval}: each item is mapped to a short tuple of discrete
+``Semantic ID'' tokens via an RQ-VAE over content embeddings, and a seq2seq
+Transformer is trained from scratch to autoregressively generate the next item's
+Semantic ID. We reimplement the full pipeline from scratch (no original code is
+public) and build a controlled study of the design choices the paper leaves
+implicit. The code reproduces the TIGER and SASRec pipelines on Amazon Beauty
+under a strict full-ranking leave-one-out protocol, then asks four questions:
+whether residual quantization is necessary (vs a prefix-conditional hierarchical
+$k$-means tree), how Semantic ID
+\emph{structure} (token order, collision-token placement, code length) affects
+quality and failure modes, whether explicit time-gap tokens help, and whether the
+autoregressive factorization is necessary at all (vs a non-autoregressive
+masked-denoising decoder). Beyond accuracy we report generative-retrieval
+diagnostics --- collision rate, invalid-code rate, and decode latency --- that
+accuracy-only tables hide.
+\end{abstract}
+
+\vspace{-0.5em}
+\section{Experimental setup}
+
+\textbf{Data.} Amazon Product Reviews (2014), category \emph{Beauty} as the
+primary benchmark, with \emph{Sports and Outdoors} and \emph{Toys and Games} as
+optional replications. For the paper-style leave-one-out reproduction we use the
+standard full-data 5-core file; Beauty then has $22{,}363$ users and $12{,}101$
+items (mean sequence length $8.9$), matching the paper. For temporal
+experiments, we instead preprocess the full review file and fit the iterative
+k-core filter only on the train window ($t< t_{\mathrm{val}}$), then keep later
+interactions for validation/test. This prevents future interactions from
+deciding which users/items enter the temporal dataset. Items are described by a
+sentence built from title, brand, price, and categories, embedded with a frozen
+Sentence-T5 encoder ($768$-dim), matching the paper.
+
+\textbf{Evaluation protocol.} We use two splits: leave-one-out (last interaction
+= test, second-to-last = validation, rest = training with all-prefix
+augmentation), used to reproduce the paper; and a global \emph{temporal} split
+(two timestamp cutoffs; history always precedes the target in wall-clock time),
+used for the quality and time-aware experiments, since leave-one-out is a weak
+quality protocol. Crucially we evaluate against the \textbf{full item catalogue,
+not sampled negatives} --- sampled metrics are a known source of inflated,
+non-comparable numbers. We report Recall@$K$ and NDCG@$K$ for $K\in\{5,10\}$.
+For temporal experiments the user/item core, Semantic-ID quantizer/tree, and
+collision-token priority are all determined from the temporal training window and
+then used to assign codes to the whole catalogue; otherwise future interactions
+or future item content would leak into the protocol.
+Collision/disambiguation tokens are also assigned to train-window items first,
+so future or cold catalogue items with the same content code cannot shift a
+training item's target Semantic ID.
+For generative models the candidate set is what beam search (beam $=100$)
+decodes; the ground-truth rank is read from that ordered list and items never
+generated count as misses. Headline TIGER and NAR numbers use
+\textbf{unconstrained} decoding (as in the paper: invalid generations are
+dropped and counted as a failure mode); trie-constrained decoding is reported
+only as an ablation, since it cannot emit invalid codes and is therefore
+optimistic. All trainers select the checkpoint with the best Recall@10 on the
+full validation split; the optional evaluation-user cap is used only for
+development runs. For temporal splits we also report the fraction of
+validation/test targets already seen in the training window, because cold target
+items affect SASRec and content-code models differently.
+
+\textbf{Models.} \emph{SASRec} (self-attentive next-item, full-softmax) is the
+main baseline. \emph{TIGER} is a T5 encoder--decoder ($d{=}128$, 4+4 layers,
+trained from scratch) over the Semantic ID token space, with per-position
+codebook offsets, a user-hash token, and a trie for prefix-constrained decoding.
+Semantic IDs use $3$ RQ-VAE levels with codebook size $256$ plus one collision
+token, giving $4$-token codes --- as in the paper.
+
+\textbf{Reproducibility.} A single \texttt{scripts/run\_beauty.sh} runs the whole
+pipeline (download $\rightarrow$ preprocess $\rightarrow$ Semantic IDs
+$\rightarrow$ all experiments). Code, README, and a synthetic smoke test that
+exercises the pipeline end-to-end without any downloads are included.
+
+\section{Research questions}
+\begin{description}[leftmargin=2.2em,style=nextline]
+\item[\textmd{\textbf{RQ1}}] \emph{Is residual quantization necessary?} Do RQ-VAE
+Semantic IDs beat a simpler prefix-conditional content tree (hierarchical
+$k$-means) built from the \emph{same} embeddings and code shape?
+\item[\textmd{\textbf{RQ2}}] \emph{How does Semantic ID structure affect quality
+and failure modes?} We vary token order (original / reversed / permuted),
+collision-token placement (last vs first), and code length / codebook size.
+\item[\textmd{\textbf{RQ3}}] \emph{Do explicit time signals help?} We discretize
+inter-event gaps into 5 buckets and compare two ways of injecting them: a
+separate gap \emph{token} interleaved between items, and --- following the course
+feedback --- a gap \emph{embedding} added to each event's token embeddings
+(analogous to SASRec's positional embedding), evaluated under a temporal split.
+\item[\textmd{\textbf{RQ4}}] \emph{Is the autoregressive pipeline necessary?} We
+compare against two non-autoregressive decoders: a MaskGIT-style masked-denoising
+model, and a simpler baseline that predicts all code positions in parallel with
+independent linear heads. Their headline metrics use unconstrained tuple
+enumeration, with trie-constrained enumeration kept as an ablation.
+\end{description}
+
+\section{Results and discussion}
+
+\textbf{Reproduction (RQ0).} Table~\ref{tab:main} shows the paper's reported
+Beauty numbers next to our runs. The current table is intentionally left as a
+fill-in table until the full GPU runs are complete. Because TIGER is trained from
+scratch on a single category, run-to-run variance is high; we will treat ``same
+ballpark and same ordering (TIGER $>$ SASRec on NDCG)'' as a successful
+reproduction rather than digit-exact matching.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Amazon Beauty, full-ranking leave-one-out. Paper values from Rajput et
+al. (2023, Table 1). ``Ours'' = our reimplementation.}
+\label{tab:main}
+\begin{tabular}{l cccc}
+\toprule
+& Recall@5 & NDCG@5 & Recall@10 & NDCG@10 \\
+\midrule
+SASRec (paper) & 0.0387 & 0.0249 & 0.0605 & 0.0318 \\
+TIGER (paper)  & 0.0454 & 0.0321 & 0.0648 & 0.0384 \\
+\midrule
+SASRec (ours)  & \fic & \fic & \fic & \fic \\
+TIGER (ours)   & \fic & \fic & \fic & \fic \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Ablations (RQ1--RQ4).} Table~\ref{tab:abl} collects the controlled
+variants, all trained and evaluated identically and compared against our own
+TIGER reproduction (the ``TIGER (ours)'' row of Table~\ref{tab:main}). Each row
+changes exactly one design choice. We also log diagnostics that pure accuracy
+hides: the pre-disambiguation \emph{collision rate} (how many items share a
+content code, i.e.\ how much work the non-semantic collision token is doing), the
+\emph{invalid-code rate} under \emph{unconstrained} decoding (overall and at
+$K\in\{5,10,20\}$; constrained decoding forces this to $\approx0$), mean
+\emph{decode latency} per user, valid-candidate coverage after invalid/duplicate
+filtering, and target-coverage diagnostics for temporal splits.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Controlled variants on Beauty ($\Delta$ vs our TIGER reproduction).
+Fill from \texttt{runs/*.json}.}
+\label{tab:abl}
+\begin{tabular}{l l cc c}
+\toprule
+RQ & Variant & R@10 & N@10 & Key diagnostic \\
+\midrule
+-- & TIGER (RQ-VAE, original) & \fic & \fic & coll.\ rate \fic \\
+RQ1 & Hierarchical $k$-means IDs & \fic & \fic & coll.\ rate \fic \\
+RQ2 & Token order: reversed & \fic & \fic & \\
+RQ2 & Token order: permuted & \fic & \fic & \\
+RQ2 & Collision token first & \fic & \fic & \\
+RQ2 & Code length $L{=}4$ levels & \fic & \fic & coll.\ rate \fic \\
+RQ3 & + time-gap token & \fic & \fic & \\
+RQ3 & + time-gap embedding & \fic & \fic & temporal split \\
+RQ4 & Masked-denoising (NAR) & \fic & \fic & inv.\ code \fic; lat.\ \fic \\
+RQ4 & Parallel linear heads & \fic & \fic & inv.\ code \fic; lat.\ \fic \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{What we expect to find, and how we will read it.}
+\begin{itemize}
+\item \textbf{RQ1.} If RQ-VAE $\approx$ hierarchical $k$-means on accuracy, the
+``residual'' machinery may not be the only driver of TIGER --- a simpler
+tree-structured content discretizer may suffice. This baseline is not a perfect
+drop-in replacement for residual quantization because its token meanings are
+prefix-conditional, so the conclusion is framed as an empirical comparison
+against a simpler content-code tree. A gap in favour of RQ-VAE supports the
+paper's hierarchy claim. We also compare collision rates: a method that collides
+less leans less on the non-semantic disambiguation token.
+\item \textbf{RQ2.} Reversing/permuting token order tests whether the model
+exploits the coarse-to-fine hierarchy (a large drop $\Rightarrow$ order carries
+real semantic signal). Moving the collision token to the front tests whether a
+non-semantic token early in the code disrupts decoding. The code-length sweep
+trades off collision rate (longer codes $\Rightarrow$ fewer collisions) against a
+harder generation target.
+\item \textbf{RQ3.} We contrast two ways of adding the same gap information: a
+separate token vs an embedding summed into each event. If the embedding helps
+where the token does not, the signal is useful but the token form wastes
+sequence length and dilutes attention; if neither helps, the autoregressive
+context already captures order. We read these under the temporal split, where
+recency genuinely matters.
+\item \textbf{RQ4.} Both non-autoregressive decoders are much faster (one forward
+pass vs $L$ steps) but cannot model left-to-right dependencies between code
+positions; the parallel-head model additionally drops all cross-position
+modelling. The accuracy ladder autoregressive $\to$ masked-denoising $\to$
+parallel heads, read together with each model's \emph{unconstrained} invalid-code
+rate and latency, quantifies how much the autoregressive factorization actually
+buys --- the core question of whether generative retrieval \emph{needs} to be
+autoregressive.
+\end{itemize}
+
+\textbf{Methodology and honest caveats.} This is a scaled-down reimplementation,
+not a bit-exact reproduction: our RQ-VAE uses a far smaller training budget than
+the paper (500 epochs, Adam, vs $\sim$20k steps, Adagrad), so we target the right
+ballpark and the right \emph{ordering}, not identical digits. We verified the
+generative evaluation end-to-end with unit tests (notably a Semantic-ID
+$\leftrightarrow$ item round-trip test after we found and fixed an off-by-one in
+the code$\to$item map that had been corrupting the generative metrics), and we
+report TIGER under paper-style unconstrained decoding with constrained decoding
+kept as a clearly-labelled ablation. The same headline-vs-ablation decoding
+distinction is used for NAR, so RQ4 does not conflate autoregressive
+factorization with trie constraints.
+
+\section{Conclusion}
+We provide a clean, fully reproducible reimplementation of TIGER and a controlled
+study that isolates four design choices the original paper bundles together,
+evaluated under full-ranking protocols and augmented with
+generative-retrieval diagnostics. The framework lets each research question be
+answered by a single command and a single changed flag, making both the positive
+and the negative results interpretable. Final numbers and per-RQ conclusions are
+populated from the GPU runs (\texttt{runs/*.json}); the analysis template above
+states in advance how each outcome should be read, so the conclusions follow
+directly from the measured deltas.
+
+\vspace{0.3em}
+{\footnotesize \textbf{References.} S.\ Rajput et al., ``Recommender Systems with
+Generative Retrieval,'' NeurIPS 2023 (arXiv:2305.05065).\quad W.-C.\ Kang, J.\
+McAuley, ``Self-Attentive Sequential Recommendation,'' ICDM 2018.}
+
+\end{document}

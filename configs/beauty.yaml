@@ -1,0 +1,60 @@
+# Reference hyper-parameters for the Amazon Beauty experiments.
+# These mirror the CLI defaults of the train_* scripts and document the
+# paper-aligned settings in one place. The scripts read CLI flags, not this
+# file; it is provided for reproducibility / bookkeeping.
+
+dataset:
+  category: Beauty
+  kcore: 5
+  review_set: 5core
+  kcore_scope: full
+  split: leave_one_out          # last item test, second-to-last val
+  max_history_items: 20
+
+temporal_dataset:
+  review_set: all
+  kcore_scope: train_temporal   # k-core is fitted only on t < val_cut
+  split: temporal
+
+semantic_ids:
+  backend: sentence-t5          # sentence-transformers/sentence-t5-base, 768-dim
+  method: rqvae                 # rqvae | hkmeans (RQ1)
+  num_levels: 3                 # + 1 disambiguation token -> code_len = 4
+  codebook_size: 256
+  latent_dim: 32
+  rqvae_epochs: 500
+  fit_split: all              # use temporal for temporal-split experiments
+
+tiger:
+  d_model: 128
+  d_ff: 1024
+  num_layers: 4                 # encoder and decoder
+  num_heads: 6
+  d_kv: 64
+  num_user_tokens: 2000
+  epochs: 100
+  batch_size: 256
+  lr: 0.0003
+  weight_decay: 0.01
+  num_beams: 100                # headline eval is unconstrained; constrained is ablation
+
+sasrec:
+  max_len: 50
+  d_model: 64
+  num_layers: 2
+  num_heads: 1
+  dropout: 0.2
+  epochs: 200
+  batch_size: 128
+  lr: 0.001
+
+nar:                            # RQ4 non-autoregressive denoiser
+  d_model: 128
+  num_layers: 4
+  mask_prob: 0.6
+  num_beams: 30
+
+eval:
+  ranking: full                 # NOT sampled negatives
+  ks: [5, 10, 20]
+  diagnostics: [collision_rate, invalid_code_rate, valid_candidate_coverage, decode_latency, target_coverage]
