@@ -57,6 +57,40 @@ def _global_grad_norm(parameters):
     return float(torch.linalg.vector_norm(torch.stack(norms), ord=2).detach().cpu())
 
 
+def _torch_load(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _save_checkpoint(path, epoch, model, opt, scaler, best, best_state, args, device):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = {
+        "epoch": int(epoch),
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best": best,
+        "best_state": best_state,
+        "args": vars(args),
+        "torch_rng_state": torch.get_rng_state(),
+        "numpy_rng_state": np.random.get_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+    }
+    torch.save(state, path)
+
+
+def _restore_rng_state(state, device):
+    if state.get("torch_rng_state") is not None:
+        torch.set_rng_state(state["torch_rng_state"])
+    if state.get("numpy_rng_state") is not None:
+        np.random.set_state(state["numpy_rng_state"])
+    cuda_state = state.get("cuda_rng_state_all")
+    if device.type == "cuda" and cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def evaluate(model, eval_dict, sp, device, num_beams, max_items, use_time_gaps,
              batch_size=64, constrained=False, measure_invalid=True, max_users=None,
              time_embed=False):
@@ -156,6 +190,12 @@ def main():
                     help="run validation every N epochs; default = epochs//10")
     ap.add_argument("--metrics-log", default=None,
                     help="optional JSONL file with per-epoch train/val/test metrics")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="directory for resumable training checkpoints")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from checkpoint-dir/last.pt when it exists")
+    ap.add_argument("--checkpoint-every", type=int, default=1,
+                    help="save last.pt every N epochs when --checkpoint-dir is set")
     ap.add_argument("--log-grad-norm", action="store_true",
                     help="log global L2 gradient norm during training")
     ap.add_argument("--grad-norm-every", type=int, default=1,
@@ -184,6 +224,10 @@ def main():
         raise ValueError("--eval-every must be positive")
     if args.grad_norm_every <= 0:
         raise ValueError("--grad-norm-every must be positive")
+    if args.checkpoint_every <= 0:
+        raise ValueError("--checkpoint-every must be positive")
+    ckpt_last = os.path.join(args.checkpoint_dir, "last.pt") if args.checkpoint_dir else None
+    ckpt_best = os.path.join(args.checkpoint_dir, "best.pt") if args.checkpoint_dir else None
     amp_enabled = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
     scaler_enabled = amp_enabled and args.amp_dtype == "float16"
@@ -230,7 +274,8 @@ def main():
         with open(args.metrics_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
-    if args.metrics_log:
+    resume_state_exists = bool(args.resume and ckpt_last and os.path.exists(ckpt_last))
+    if args.metrics_log and not resume_state_exists:
         os.makedirs(os.path.dirname(args.metrics_log) or ".", exist_ok=True)
         with open(args.metrics_log, "w", encoding="utf-8") as f:
             f.write(json.dumps({"phase": "config", "config": vars(args)}, sort_keys=True) + "\n")
@@ -292,7 +337,19 @@ def main():
 
     import copy
     best, best_state = None, None
-    for ep in range(args.epochs):
+    start_epoch = 0
+    if resume_state_exists:
+        state = _torch_load(ckpt_last, device)
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        if state.get("scaler") is not None:
+            scaler.load_state_dict(state["scaler"])
+        best = state.get("best")
+        best_state = state.get("best_state")
+        start_epoch = int(state.get("epoch", 0))
+        _restore_rng_state(state, device)
+        print(f"resumed checkpoint {ckpt_last} at epoch={start_epoch}", flush=True)
+    for ep in range(start_epoch, args.epochs):
         model.train(); tot = 0
         grad_norm_sum = grad_norm_max = 0.0
         grad_norm_count = 0
@@ -350,14 +407,20 @@ def main():
                   flush=True)
             if best is None or vm["recall@10"] > best:
                 best = vm["recall@10"]
-                best_state = copy.deepcopy(model.state_dict())  # checkpoint best
+                best_state = copy.deepcopy(model.state_dict())
                 record["best_val_recall@10"] = best
                 wandb_payload["val/best_recall@10"] = float(best)
+                if ckpt_best:
+                    _save_checkpoint(ckpt_best, ep + 1, model, opt, scaler,
+                                     best, best_state, args, device)
         else:
             print(f"epoch {ep+1} loss={avg_loss:.4f}{grad_txt}", flush=True)
         write_metrics(record)
         if wandb_run is not None:
             wandb_run.log(wandb_payload, step=ep + 1)
+        if ckpt_last and (ep + 1) % args.checkpoint_every == 0:
+            _save_checkpoint(ckpt_last, ep + 1, model, opt, scaler,
+                             best, best_state, args, device)
 
     if best_state is not None:           # evaluate test on the best-val checkpoint
         model.load_state_dict(best_state)

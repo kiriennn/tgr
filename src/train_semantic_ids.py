@@ -24,6 +24,13 @@ from semantic_ids.hkmeans import hierarchical_kmeans
 from runtime import select_device
 
 
+def _torch_load(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def training_fit_indices(data_dir: str, fit_split: str, num_items: int) -> np.ndarray | None:
     """Return 0-based item indices used to fit Semantic-ID codebooks.
 
@@ -54,7 +61,8 @@ def training_fit_indices(data_dir: str, fit_split: str, num_items: int) -> np.nd
 
 
 def train_rqvae(emb, num_levels, codebook_size, latent_dim, epochs, device, seed=42,
-                fit_indices=None):
+                fit_indices=None, checkpoint_dir=None, resume=False,
+                checkpoint_every=20):
     torch.manual_seed(seed)
     x_all = torch.tensor(emb, dtype=torch.float32, device=device)
     if fit_indices is None:
@@ -63,13 +71,28 @@ def train_rqvae(emb, num_levels, codebook_size, latent_dim, epochs, device, seed
     x = x_all[torch.tensor(fit_indices, dtype=torch.long, device=device)]
     model = RQVAE(input_dim=emb.shape[1], latent_dim=latent_dim,
                   num_levels=num_levels, codebook_size=codebook_size).to(device)
-    with torch.no_grad():
-        model.init_codebooks(x)            # k-means init for EVERY level's codebook
-    model.train()
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    ckpt_path = os.path.join(checkpoint_dir, "rqvae_last.pt") if checkpoint_dir else None
+    start_epoch = 0
+    if resume and ckpt_path and os.path.exists(ckpt_path):
+        state = _torch_load(ckpt_path, device)
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        start_epoch = int(state.get("epoch", 0))
+        if state.get("torch_rng_state") is not None:
+            torch.set_rng_state(state["torch_rng_state"])
+        if state.get("numpy_rng_state") is not None:
+            np.random.set_state(state["numpy_rng_state"])
+        if device.type == "cuda" and state.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+        print(f"resumed RQ-VAE checkpoint {ckpt_path} at epoch={start_epoch}")
+    else:
+        with torch.no_grad():
+            model.init_codebooks(x)
+    model.train()
     n = x.shape[0]
     bs = min(1024, n)
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         model.train()
         perm = torch.randperm(n, device=device)
         tot = 0.0
@@ -89,6 +112,16 @@ def train_rqvae(emb, num_levels, codebook_size, latent_dim, epochs, device, seed
         if (ep + 1) % 20 == 0:
             print(f"  epoch {ep+1}/{epochs} loss={tot/((n+bs-1)//bs):.4f} "
                   f"recon={logs['recon']:.4f} vq={logs['vq']:.4f}")
+        if ckpt_path and (ep + 1) % checkpoint_every == 0:
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            torch.save({
+                "epoch": ep + 1,
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+                "numpy_rng_state": np.random.get_state(),
+                "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+            }, ckpt_path)
     return model.encode_codes(x_all).cpu().numpy()
 
 
@@ -104,6 +137,9 @@ def main():
                     help="sentence-t5 | random (random = offline plumbing only)")
     ap.add_argument("--force-recompute-embeddings", action="store_true",
                     help="ignore cached content embeddings and rebuild them")
+    ap.add_argument("--checkpoint-dir", default=None)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--checkpoint-every", type=int, default=20)
     ap.add_argument("--fit-split", choices=["all", "leave_one_out", "temporal"],
                     default="all",
                     help="which items are used to FIT the Semantic-ID quantizer/tree. "
@@ -112,6 +148,8 @@ def main():
     ap.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    if args.checkpoint_every <= 0:
+        raise ValueError("--checkpoint-every must be positive")
     device = select_device(args.device)
     print(f"device={device}")
 
@@ -168,7 +206,10 @@ def main():
         print("training RQ-VAE...")
         codes = train_rqvae(emb, args.num_levels, args.codebook_size,
                             args.latent_dim, args.rqvae_epochs, device, args.seed,
-                            fit_indices=fit_indices)
+                            fit_indices=fit_indices,
+                            checkpoint_dir=args.checkpoint_dir,
+                            resume=args.resume,
+                            checkpoint_every=args.checkpoint_every)
     else:
         print("hierarchical k-means...")
         codes = hierarchical_kmeans(emb, num_levels=args.num_levels,
